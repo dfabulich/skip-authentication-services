@@ -6,3 +6,13 @@
 #    - block: 'dependencies'
 #      contents:
 #        - 'implementation("androidx.compose.runtime:runtime")'
+
+skip:
+  mode: 'transpiled'
+  bridging: true
+
+build:
+  contents:
+    - block: 'dependencies'
+      contents:
+        - 'implementation("androidx.browser:browser:1.9.0")'
