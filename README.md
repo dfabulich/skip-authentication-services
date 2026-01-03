@@ -1,3 +1,6 @@
+> [!NOTE]
+> Moved to https://github.com/skiptools/skip-authentication-services
+
 # SkipAuthenticationServices
 
 This module provides a compatibility API corresponding to Apple's [AuthenticationServices](https://developer.apple.com/documentation/AuthenticationServices) framework.
