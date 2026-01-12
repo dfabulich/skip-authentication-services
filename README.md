@@ -25,6 +25,30 @@ let package = Package(
 )
 ```
 
+### Setup fallback support for old versions of Chrome
+
+Our implementation of `WebAuthenticationSession` is built on top of Google's [Auth Tab](https://developer.chrome.com/docs/android/custom-tabs/guide-auth-tab), which is designed to work in Chrome browser versions 137 and later. Chrome 137 was released in May 2025; not all of your users may have updated to it, especially users on older versions of Android.
+
+In that case, the code includes a "fallback" to launch a [Custom Tab](https://developer.android.com/develop/ui/views/layout/webapps/overview-of-android-custom-tabs). To make that fallback work, you'll need to add an `<intent-filter>` to your `AndroidManifest.xml` file, like this:
+
+```
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- ... -->
+    <applicatio>
+        <!-- ... -->
+        <activity>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="org.appfair.app.showcaselite" android:host="auth" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+```
+
 ## Web Authentication Session
 
 Your app can login using a web site you control using [`WebAuthenticationSession`](https://developer.apple.com/documentation/authenticationservices/webauthenticationsession). We support both the deprecated legacy iOS 16.4 API, [`authenticate(using:callbackURLScheme:preferredBrowserSession:)`](https://developer.apple.com/documentation/authenticationservices/webauthenticationsession/authenticate%28using:callbackurlscheme:preferredbrowsersession:%29), as well as the iOS 17.4 API, [`authenticate(using:callback:preferredBrowserSession:additionalHeaderFields:)`](https://developer.apple.com/documentation/authenticationservices/webauthenticationsession/authenticate%28using:callback:preferredbrowsersession:additionalheaderfields:%29).
@@ -34,6 +58,9 @@ First, you'll need to have a login page on a web site you control. When the user
 Your web site should pass an authentication token in a query parameter to the redirect URL, e.g. `com.example.myapp://auth?login_token=12345abcdef`. When the user signs in, `WebAuthenticationSession` will dismiss the login screen and return the URL containing the token. 
 
 If you need to store the token securely, consider storing it in the user's keychain with the [skip-keychain](https://github.com/skiptools/skip-keychain) library.
+
+> [!IMPORTANT]
+> Be sure to test `WebAuthenticationSession` on the oldest version of Android that you support, as well as the latest version. Old versions of Android require additional "fallback" setup; see the previous section for details.
 
 ```swift
 #if os(Android)

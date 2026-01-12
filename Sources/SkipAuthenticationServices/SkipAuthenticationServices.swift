@@ -5,6 +5,8 @@
 import Foundation
 import SwiftUI
 import androidx.browser.auth.AuthTabIntent
+import androidx.browser.customtabs.CustomTabsClient
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.ActivityResultRegistry
@@ -13,6 +15,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import android.net.Uri
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
+import androidx.core.util.Consumer
 import java.util.UUID
 import kotlinx.coroutines.suspendCancellableCoroutine
 
@@ -95,44 +99,125 @@ public struct WebAuthenticationSession {
         
         let androidUri = Uri.parse(url.absoluteString)
         
-        let builder = AuthTabIntent.Builder()
-        if preferredBrowserSession == .ephemeral {
-            builder.setEphemeralBrowsingEnabled(true)
-        }
-        let authTabIntent = builder.build()
+        let packageName = CustomTabsClient.getPackageName(activity, nil)
+        let isAuthTabSupported = packageName != nil && CustomTabsClient.isAuthTabSupported(activity, packageName!)
         
-        var launcher: ActivityResultLauncher<android.content.Intent>? = nil
-        defer { launcher?.unregister() }
-        
-        return try await suspendCancellableCoroutine { continuation in
-            let registry = activity.activityResultRegistry
-            let uniqueKey = UUID.randomUUID().toString()
-            let contract = ActivityResultContracts.StartActivityForResult()
+        if isAuthTabSupported {
+            let builder = AuthTabIntent.Builder()
+            if preferredBrowserSession == .ephemeral {
+                builder.setEphemeralBrowsingEnabled(true)
+            }
+            let authTabIntent = builder.build()
             
-            launcher = registry.register(uniqueKey, contract) { activityResult in
-                if activityResult.resultCode == Activity.RESULT_OK {
-                    if let resultData = activityResult.data, let resultUri = resultData.data, let callbackURL = URL(string: resultUri.toString()) {
-                        continuation.resumeWith(kotlin.Result.success(callbackURL))
+            var launcher: ActivityResultLauncher<android.content.Intent>? = nil
+            defer { launcher?.unregister() }
+            
+            return try await suspendCancellableCoroutine { continuation in
+                let registry = activity.activityResultRegistry
+                let uniqueKey = UUID.randomUUID().toString()
+                let contract = ActivityResultContracts.StartActivityForResult()
+                
+                launcher = registry.register(uniqueKey, contract) { activityResult in
+                    if activityResult.resultCode == Activity.RESULT_OK {
+                        if let resultData = activityResult.data, let resultUri = resultData.data, let callbackURL = URL(string: resultUri.toString()) {
+                            continuation.resumeWith(kotlin.Result.success(callbackURL))
+                        } else {
+                            let error = RuntimeException("WebAuthenticationSession invalid activity result data, should be a valid URL string, got: \(String(describing: activityResult.data))")
+                            continuation.resumeWith(kotlin.Result.failure(error))
+                        }
+                    } else if activityResult.resultCode == Activity.RESULT_CANCELED {
+                        let error = ASWebAuthenticationSessionError(code: .canceledLogin)
+                        continuation.resumeWith(kotlin.Result.failure(error))
                     } else {
-                        let error = RuntimeException("WebAuthenticationSession invalid activity result data, should be a valid URL string, got: \(String(describing: activityResult.data))")
+                        let error = RuntimeException("WebAuthenticationSession unknown result code: \(activityResult.resultCode)")
                         continuation.resumeWith(kotlin.Result.failure(error))
                     }
-                } else if activityResult.resultCode == Activity.RESULT_CANCELED {
-                    let error = ASWebAuthenticationSessionError(code: .canceledLogin)
-                    continuation.resumeWith(kotlin.Result.failure(error))
-                } else {
-                    let error = RuntimeException("WebAuthenticationSession unknown result code: \(activityResult.resultCode)")
-                    continuation.resumeWith(kotlin.Result.failure(error))
+                }
+                
+                // Use the appropriate launch method based on callback type
+                switch callback {
+                case .customScheme(let callbackURLScheme):
+                    authTabIntent.launch(launcher!, androidUri, callbackURLScheme)
+                case .https(let redirectHost, let redirectPath):
+                    authTabIntent.launch(launcher!, androidUri, redirectHost, redirectPath)
+                }
+            }
+        } else {
+            // Fallback to Custom Tabs
+            var listener: CustomTabsIntentListener? = nil
+            defer {
+                let listenerToRemove = listener
+                if let listenerToRemove = listenerToRemove {
+                    activity.removeOnNewIntentListener(listenerToRemove)
                 }
             }
             
-            // Use the appropriate launch method based on callback type
+            // Assert that the activity has an intent filter matching the callback URL scheme
+            let testCallbackURL: String
             switch callback {
-            case .customScheme(let callbackURLScheme):
-                authTabIntent.launch(launcher!, androidUri, callbackURLScheme)
+            case .customScheme(let scheme):
+                // Use a minimal test URL - the host requirement will be checked by the intent filter
+                testCallbackURL = "\(scheme)://auth"
             case .https(let redirectHost, let redirectPath):
-                authTabIntent.launch(launcher!, androidUri, redirectHost, redirectPath)
+                testCallbackURL = "https://\(redirectHost)\(redirectPath)"
             }
+            
+            let testIntent = Intent(Intent.ACTION_VIEW, Uri.parse(testCallbackURL))
+            testIntent.addCategory(Intent.CATEGORY_BROWSABLE)
+            testIntent.addCategory(Intent.CATEGORY_DEFAULT)
+            
+            let packageManager = activity.packageManager
+            let resolveInfos = packageManager.queryIntentActivities(testIntent, PackageManager.MATCH_DEFAULT_ONLY)
+            
+            // Check if any resolved activity matches the current activity
+            // activityInfo.name can be either fully qualified or relative (starting with .)
+            let currentActivityName = activity.javaClass.name
+            let currentActivitySimpleName = "." + activity.javaClass.simpleName
+            let canHandleCallback = resolveInfos.any { resolveInfo in
+                let resolvedName = resolveInfo.activityInfo.name
+                resolveInfo.activityInfo.packageName == activity.packageName &&
+                (resolvedName == currentActivityName || resolvedName == currentActivitySimpleName)
+            }
+            
+            assert(canHandleCallback, "Activity \(currentActivityName) does not have an intent filter matching callback URL scheme. Expected URL: \(testCallbackURL). Add an intent-filter to AndroidManifest.xml with the matching scheme.")
+            
+            return try await suspendCancellableCoroutine { continuation in
+                let createdListener = CustomTabsIntentListener { intent in
+                    if let dataString = intent.dataString, let callbackURL = URL(string: dataString) {
+                        // Check if the URL matches our callback
+                        switch callback {
+                        case .customScheme(let scheme):
+                            if callbackURL.scheme == scheme {
+                                continuation.resumeWith(kotlin.Result.success(callbackURL))
+                            }
+                        case .https(let redirectHost, let redirectPath):
+                            if callbackURL.scheme == "https",
+                               let host = callbackURL.host, host == redirectHost,
+                               callbackURL.path == redirectPath {
+                                continuation.resumeWith(kotlin.Result.success(callbackURL))
+                            }
+                        }
+                    }
+                }
+                
+                listener = createdListener
+                activity.addOnNewIntentListener(createdListener)
+                
+                let customTabsIntent = CustomTabsIntent.Builder().build()
+                customTabsIntent.intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                customTabsIntent.launchUrl(activity, androidUri)
+            }
+        }
+    }
+}
+
+struct CustomTabsIntentListener : Consumer<Intent> {
+    let onCallback: (Intent) -> Void
+    
+    override func accept(value: Intent) {
+        android.util.Log.d("CustomTabsIntentListener", "accept: \(value)")
+        if value.action == Intent.ACTION_VIEW {
+            onCallback(value)
         }
     }
 }
